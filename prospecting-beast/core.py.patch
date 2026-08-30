@@ -1,0 +1,145 @@
+--- app/core.py	2026-08-30 22:28:07.325007053 +0000
++++ /mnt/data/prospecting_beast_v32_rework/app/core.py	2026-08-30 22:27:14.189391189 +0000
+@@ -7,6 +7,7 @@
+ from bs4 import BeautifulSoup
+ from dotenv import load_dotenv
+ from .osint_tools import xray_matrix, extract_public_emails
++from .cache import get as cache_get, set as cache_set
+ 
+ BASE = Path(__file__).resolve().parents[1]
+ load_dotenv(BASE / '.env')
+@@ -220,11 +221,18 @@
+             'Include titles close/related to target roles; local fuzzy matching decides qualification. '
+             'Ignore customers, competitors, authors, speakers, and unclear employment. '
+             'Return ONLY JSON: {"people":[{"name":"","title":"","linkedin_url":"","source_url":""}]}')
++    cache_payload={'company':company,'domain':domain,'mode':mode,'evidence':evidence[-48:]}
++    cached=await cache_get('gemini_people', cache_payload)
++    if isinstance(cached, list):
++        return cached
+     body={'contents':[{'parts':[{'text':prompt+f'\nTarget company: {company} ({domain})\nTarget roles: {json.dumps(targets)}\nEvidence:\n{json.dumps(evidence)[:50000]}'}]}], 'generationConfig':{'responseMimeType':'application/json','temperature':0.0}}
+     async with await http_client() as c:
+         try:
+             r=await c.post(f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}',json=body); r.raise_for_status()
+-            obj=json.loads(r.json()['candidates'][0]['content']['parts'][0]['text']); return obj.get('people',[]) if isinstance(obj,dict) else []
++            obj=json.loads(r.json()['candidates'][0]['content']['parts'][0]['text'])
++            people=obj.get('people',[]) if isinstance(obj,dict) else []
++            await cache_set('gemini_people', cache_payload, people)
++            return people
+         except Exception: return []
+ 
+ 
+@@ -413,6 +421,38 @@
+         return []
+ 
+ 
++MEGA_CORP_DOMAINS = {
++    'microsoft.com','google.com','apple.com','amazon.com','meta.com','ibm.com','oracle.com',
++    'salesforce.com','sap.com','adobe.com','intel.com','nvidia.com','cisco.com','accenture.com',
++    'deloitte.com','pwc.com','ey.com','kpmg.com','walmart.com','jpmorgan.com','bankofamerica.com',
++}
++
++
++def _infer_employee_band(pages: list[dict]) -> int | None:
++    """Best-effort headcount signal from first-party public text; never requires a paid source."""
++    text=' '.join(str(p.get('content','')) for p in pages[:8]).lower()
++    patterns=[
++        r'(\d[\d,]{2,})\s*\+?\s*(?:employees|people|team members|staff)',
++        r'(?:team of|more than)\s*(\d[\d,]{2,})\s*(?:employees|people)',
++    ]
++    vals=[]
++    for pat in patterns:
++        for m in re.finditer(pat, text):
++            try: vals.append(int(m.group(1).replace(',','')))
++            except ValueError: pass
++    return min(vals) if vals else None
++
++
++def auto_search_budget(domain: str, requested: int, official_pages: list[dict]) -> tuple[int,str]:
++    d=norm_domain(domain)
++    if d in MEGA_CORP_DOMAINS:
++        return min(4, max(1, int(requested or 4))), 'mega-corp'
++    headcount=_infer_employee_band(official_pages)
++    if headcount is not None and headcount < 500:
++        return min(12, max(1, int(requested or 12))), 'startup-under-500'
++    return max(1, min(int(requested or 6), 16)), 'standard'
++
++
+ async def web_people_discovery(company: str, domain: str, mode: str, max_people: int=10, search_budget: int=8, location: str="", industry: str="", agentic: bool=False) -> dict:
+     """Web-first employee discovery.
+ 
+@@ -439,12 +479,16 @@
+             'content': pg.get('content','')[:12000], 'score': 1.0, 'query': 'official_company_page'
+         })
+     if evidence:
+-        people.extend(await gemini_extract_people(qbase, domain, evidence, mode))
++        initial=await gemini_extract_people(qbase, domain, evidence, mode)
++        people.extend(initial[:max_people])
++        if sum(1 for p in people if base_score(p.get('title') or p.get('job_title') or '', mode)) >= max_people:
++            return {'people': people[:max_people], 'evidence_count': len(evidence), 'query_count': 0, 'estimated_tavily_credits': 0, 'target_terms': list(title_dictionary(mode).keys()), 'sources_used': ['official_company_page']}
+ 
+     # Adaptive OSINT: official pages + optional passive open-source connectors + targeted public-web queries.
+     official_pages = official_pages  # keep first-party evidence gathered above
+     evidence.extend(await spiderfoot_osint(domain))
+     evidence.extend(await amass_passive_osint(domain))
++    search_budget, budget_reason = auto_search_budget(domain, search_budget, official_pages)
+     queries = build_role_queries(qbase, domain, mode, location, industry)[:search_budget]
+ 
+     # Keep a compact evidence set to prevent prompts from becoming huge.
+@@ -506,6 +550,7 @@
+             add_people(batch)
+             # Stop once we have enough raw candidates that can be locally qualified.
+             qualified=sum(1 for p in people if base_score(p.get('title') or p.get('job_title') or '', mode))
++            # HARD QUOTA: after every Gemini extraction batch, stop immediately.
+             if qualified >= max_people:
+                 break
+ 
+@@ -548,6 +593,8 @@
+         'people': qualified[:max_people],
+         'evidence_count': len(evidence),
+         'query_count': len(queries),
++        'search_budget_used': len(queries),
++        'search_budget_reason': budget_reason,
+         'estimated_tavily_credits': sum(2 if (item[1]=='linkedin' and i < 2) else 1 for i, item in enumerate(queries)),
+         'target_terms': list(title_dictionary(mode).keys()),
+         'sources_used': sorted(set((e.get('source') or e.get('query') or 'web').split(':')[0] for e in evidence)),
+@@ -569,12 +616,17 @@
+         payload['include_domains']=include_domains
+     if exclude_domains:
+         payload['exclude_domains']=exclude_domains
++    cached=await cache_get('tavily', payload)
++    if isinstance(cached, dict):
++        return cached
+     async with await http_client() as c:
+         r = await c.post('https://api.tavily.com/search',
+                          headers={'Authorization': f'Bearer {key}', 'Content-Type':'application/json'},
+                          json=payload)
+         r.raise_for_status()
+-        return r.json()
++        data=r.json()
++        await cache_set('tavily', payload, data)
++        return data
+ 
+ 
+ async def gemini_classify(company: str, domain: str, evidence: list[dict]):
+@@ -584,6 +636,10 @@
+         raise RuntimeError('Missing GEMINI_API_KEY')
+     prompt = """You are a strict corporate-structure verifier. Use ONLY the supplied search evidence. Identify credible corporate-family entities directly related to the target company. Valid relationships: parent, subsidiary, sister, brand, acquired_target, related, unknown. Do not invent domains. Prefer official company pages, filings, exchange disclosures, acquisition announcements, or reputable business sources. Return ONLY JSON in this shape: {\"relationships\":[{\"company\":\"...\",\"domain\":\"...\",\"relationship\":\"parent|subsidiary|sister|brand|acquired_target|related|unknown\",\"confidence\":0.0,\"reason\":\"...\"}]}. Ignore entities that are merely customers, partners, suppliers, competitors, people, or articles that mention the company without a corporate relationship."""
+     payload_evidence = evidence or []
++    cache_payload={'company':company,'domain':domain,'evidence':payload_evidence[-48:]}
++    cached=await cache_get('gemini_family', cache_payload)
++    if isinstance(cached, list):
++        return cached
+     body = {'contents':[{'parts':[{'text': prompt + f'\\nTarget: {company} ({domain})\\nEvidence:\\n{json.dumps(payload_evidence)[:45000]}'}]}], 'generationConfig':{'responseMimeType':'application/json','temperature':0.0}}
+     try:
+         async with await http_client() as c:
+@@ -599,7 +655,9 @@
+                 return []
+             obj = json.loads(text)
+             rels = obj.get('relationships', []) if isinstance(obj, dict) else []
+-            return rels if isinstance(rels, list) else []
++            rels = rels if isinstance(rels, list) else []
++            await cache_set('gemini_family', cache_payload, rels)
++            return rels
+     except Exception:
+         return []
+ 
