@@ -1,0 +1,40 @@
+{
+  "f": {
+    "IT Manager": 100,
+    "IT Director": 100,
+    "Head of IT": 80,
+    "VP of IT": 80,
+    "CIO": 50,
+    "CTO": 50,
+    "System Administrator": 100,
+    "Network Manager": 100,
+    "Security Manager": 100,
+    "IT Infrastructure Manager": 100,
+    "Cyber Security Manager": 100,
+    "Cybersecurity Manager": 100,
+    "End User Manager": 90,
+    "Help Desk Manager": 100
+  },
+  "nf": {
+    "CEO": 50,
+    "Co-Founder": 50,
+    "CTO": 60,
+    "CIO": 80,
+    "IT Manager": 100,
+    "Head of IT": 90,
+    "IT Director": 100,
+    "Owner": 30,
+    "Founder": 30,
+    "Head of Data": 80,
+    "IT Admin": 100,
+    "Transformation Manager": 100,
+    "IT Cloud Manager": 100,
+    "Cloud Manager": 90,
+    "Head of DevOps": 100,
+    "IT Security Manager": 90,
+    "Operations Manager": 100,
+    "IT Operations Manager": 100,
+    "DevOps Manager": 90,
+    "Head of Infrastructure": 100
+  }
+}
