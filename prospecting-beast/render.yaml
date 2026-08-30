@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: prospecting-beast
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: APP_PASSWORD
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: APOLLO_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash-lite
+      - key: SEAMLESS_API_KEYS
+        sync: false
+      - key: SEAMLESS_FAMILY_CREDITS
+        value: "20"
+      - key: DRY_RUN
+        value: "true"

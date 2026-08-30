@@ -1,0 +1,256 @@
+--- /mnt/data/audit_v33/app/main.py	2026-08-30 22:07:48.000000000 +0000
++++ app/main.py	2026-08-30 22:34:12.552857303 +0000
+@@ -9,6 +9,7 @@
+ 
+ from .core import *
+ from .osint_tools import xray_matrix, email_candidates_and_mx, fetch_public_page, parse_public_people
++from .enrichment import email_permutations, mx_hosts, detect_catch_all, scrape_public_emails
+ 
+ app = FastAPI(title='Prospecting Beast // Web Edition', version='32.0')
+ security = HTTPBasic(auto_error=False)
+@@ -446,7 +447,11 @@
+     # stored as ready/skipped and enriched only when the user explicitly clicks
+     # “Seamless Enrich”.
+     saved_here=0
++    max_people=int(cfg.get('max_people_per_company',50) or 50)
+     for _, info, raw_person in ranked:
++        if saved_here >= max_people:
++            await append_log(job_id, f'[{domain}] PEOPLE QUOTA REACHED — {saved_here}/{max_people}; stopping lead persistence.', 'success')
++            break
+         if await job_stop_requested(job_id):
+             await append_log(job_id, f'[{domain}] Stop requested — skipping remaining lead saves.', 'warning')
+             break
+@@ -513,6 +518,13 @@
+ 
+ 
+ async def process_job(jid: str, cfg: dict):
++    """Run each family with a bounded concurrent company frontier.
++
++    Subsidiaries discovered from the current frontier are sorted by confidence and
++    processed in batches through a shared semaphore. This fixes the old dead queue
++    while avoiding an unbounded Tavily fan-out.
++    """
++    semaphore = asyncio.Semaphore(3)
+     try:
+         await update_job(jid,status='running')
+         await append_log(jid,'Job started')
+@@ -526,80 +538,99 @@
+         cfg.setdefault('family_credit_usage', {})
+         existing_job = await get_job(jid)
+         existing_stats = (existing_job or {}).get('stats') or {}
+-        total_companies = int(existing_stats.get('companies_processed',0) or 0)
+-        total_credits = int(existing_stats.get('seamless_credits_used',0) or 0)
+-        total_leads = int(existing_stats.get('leads_saved',0) or 0)
+-        root_index = 0
+-        for root in roots:
++        total_companies=int(existing_stats.get('companies_processed',0) or 0)
++        total_credits=int(existing_stats.get('seamless_credits_used',0) or 0)
++        total_leads=int(existing_stats.get('leads_saved',0) or 0)
++
++        async def run_company(item, family_id, root, family_state):
++            domain, relationship, parent_domain = item
++            async with semaphore:
++                before=family_state.get('leads_saved',0)
++                try:
++                    related=await process_company(jid,family_id,root,domain,relationship,parent_domain,cfg,pool,family_state,lead_cache)
++                    return domain, related or [], max(0, family_state.get('leads_saved',0)-before), None
++                except Exception as exc:
++                    return domain, [], 0, exc
++
++        for root_index, root in enumerate(roots,1):
+             if await job_stop_requested(jid):
+-                await mark_job_stopped(jid, 'Stop requested — no new families will be started.')
++                await mark_job_stopped(jid,'Stop requested — no new families will be started.')
+                 return
+-            root_index += 1
+-            rows = by_root.get(root, [])
+-            family_id = rows[0].get('family_id') if rows and rows[0].get('family_id') else str(uuid.uuid4())
+-            completed={c.get('domain') for c in rows if c.get('status') in ('done','done_no_people')}
+-            queue=[]
++            rows=by_root.get(root,[])
++            family_id=rows[0].get('family_id') if rows and rows[0].get('family_id') else str(uuid.uuid4())
++            done={c.get('domain') for c in rows if c.get('status') in ('done','done_no_people')}
++            frontier=[]
+             if rows:
+                 for c in rows:
+-                    status=(c.get('status') or 'queued').lower()
+-                    if c.get('domain') and c.get('domain') not in completed and status in ('queued','processing','error','stopped'):
+-                        queue.append((c['domain'],c.get('relationship','related'),c.get('parent_domain')))
+-                if not queue and root not in completed:
+-                    queue=[(root,'original',None)]
+-            else:
+-                queue=[(root,'original',None)]
++                    if c.get('domain') and c.get('domain') not in done and (c.get('status') or '').lower() in ('queued','processing','error','stopped'):
++                        frontier.append((c['domain'],c.get('relationship','related'),c.get('parent_domain'),1.0))
++            if not frontier and root not in done:
++                frontier=[(root,'original',None,1.0)]
+             family_state={'credits_used':int((cfg.get('family_credit_usage') or {}).get(root,0) or 0),'leads_saved':0}
+-            family_companies=0
+-            last_domain=root
+-            await append_log(jid,f'Starting family {root} ({root_index}/{len(roots)}) — resuming {len(queue)} queued companies.' if rows else f'Starting family {root} ({root_index}/{len(roots)})')
+-            while queue and family_companies < cfg['max_companies_per_family']:
++            processed_in_family=0
++            seen_in_family=set(done)
++            await append_log(jid, f'Starting family {root} ({root_index}/{len(roots)}) — concurrent frontier.' if rows else f'Starting family {root} ({root_index}/{len(roots)})')
++
++            while frontier and processed_in_family < cfg['max_companies_per_family']:
+                 if await job_stop_requested(jid):
+-                    await mark_job_stopped(jid, f'Family {root} stopped by user.')
++                    await mark_job_stopped(jid,f'Family {root} stopped by user.')
+                     return
+-                domain, relationship, parent_domain = queue.pop(0)
+-                last_domain=domain
+-                if domain in completed:
+-                    continue
+-                family_companies += 1
+-                total_companies += 1
+-                await update_stats(jid, root_companies=len(roots), companies_processed=total_companies, current_company=domain, current_root=root, family_credits_used=family_state['credits_used'], leads_saved=total_leads)
+-                try:
+-                    before_company_credits = family_state['credits_used']
+-                    before_company_leads = family_state.get('leads_saved',0)
+-                    related = await process_company(jid,family_id,root,domain,relationship,parent_domain,cfg,pool,family_state,lead_cache)
+-                    total_credits += max(0, family_state['credits_used'] - before_company_credits)
+-                    total_leads += max(0, family_state.get('leads_saved',0) - before_company_leads)
+-                    cfg['family_credit_usage'][root]=family_state['credits_used']
+-                    await update_job(jid, config=cfg)
+-                except Exception as e:
+-                    await append_log(jid,f'{domain}: ERROR {e}','error')
+-                    row = await sb_select('companies',params={'job_id':f'eq.{jid}','domain':f'eq.{domain}','select':'id','limit':'1'})
+-                    if row:
+-                        await sb_update('companies',{'id':row[0]['id']},{'status':'error','updated_at':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()})
+-                    continue
+-                added=0
+-                for rr in related or []:
+-                    rd=norm_domain(rr.get('domain',''))
+-                    conf=float(rr.get('confidence',0) or 0)
+-                    rel=(rr.get('relationship') or 'related').lower().strip()
+-                    queue_score=float(rr.get('queue_score') or 0)
+-                    await save_relationship(jid,family_id,domain,rr)
+-                    # Only queue high-value corporate relationships for prospecting.
+-                    # Keep lower-value relationships in the map, but don't let brands /
+-                    # vague 'related' entities explode the family queue.
+-                    min_conf=float(env('MIN_RELATIONSHIP_CONFIDENCE','0.72'))
+-                    min_queue_score=float(env('MIN_RELATIONSHIP_QUEUE_SCORE','55'))
+-                    if not rd or rd==domain or rd in completed or any(x[0]==rd for x in queue) or conf < min_conf or queue_score < min_queue_score:
+-                        continue
+-                    if added >= cfg['max_related_per_company']:
++                # Highest-confidence subsidiaries first. Originals get priority 1.0.
++                frontier.sort(key=lambda x:(x[3], 1 if x[1]=='original' else 0), reverse=True)
++                capacity=max(0, cfg['max_companies_per_family']-processed_in_family)
++                batch=frontier[:min(3,capacity)]
++                frontier=frontier[len(batch):]
++                batch=[x for x in batch if x[0] not in seen_in_family]
++                if not batch: continue
++                for x in batch: seen_in_family.add(x[0])
++                await update_stats(jid, root_companies=len(roots), companies_processed=total_companies, current_company=', '.join(x[0] for x in batch), current_root=root, family_credits_used=family_state['credits_used'], leads_saved=total_leads)
++                results=await asyncio.gather(*(run_company(x[:3],family_id,root,family_state) for x in batch))
++                processed_in_family += len(results)
++                total_companies += len(results)
++                newly_leads=sum(r[2] for r in results)
++                total_leads += newly_leads
++                # Company workers update Tavily usage themselves; refresh the global
++                # counters after the concurrent batch so one task cannot clobber another.
++                current_job=await get_job(jid)
++                current_stats=(current_job or {}).get('stats') or {}
++                total_credits=int(current_stats.get('tavily_estimated_credits',0) or 0)
++                for domain, related, _, err in results:
++                    if err:
++                        await append_log(jid,f'{domain}: ERROR {err}','error')
++                        row=await sb_select('companies',params={'job_id':f'eq.{jid}','domain':f'eq.{domain}','select':'id','limit':'1'})
++                        if row:
++                            await sb_update('companies',{'id':row[0]['id']},{'status':'error','updated_at':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()})
+                         continue
+-                    queue.append((rd,rel,domain))
+-                    await find_or_create_company(jid,family_id,root,rd,rel,domain,rr.get('company') or rr.get('name'))
+-                    added += 1
+-                await append_log(jid,f'{domain}: corporate research found {len(related or [])} candidates; queued {added}.')
+-            await update_stats(jid, root_companies=len(roots), companies_processed=total_companies, seamless_credits_used=total_credits, current_company=last_domain, current_root=root, leads_saved=total_leads)
+-            await append_log(jid,f'Family {root} complete. Seamless research used {family_state["credits_used"]}/{cfg["max_enrich_per_family"]}. Leads saved this family: {family_state.get("leads_saved",0)}.')
+-        job = await get_job(jid); st=job.get('stats') or {}; st.update({'root_companies':len(roots),'companies_processed':total_companies,'seamless_credits_used':total_credits,'leads_saved':total_leads})
++                    # Queue qualifying subsidiaries/related companies. Dedup happens both
++                    # in-memory and against the existing completed set.
++                    added=0
++                    for rr in sorted(related or [], key=lambda r:(float(r.get('confidence',0) or 0), float(r.get('queue_score',0) or 0)), reverse=True):
++                        rd=norm_domain(rr.get('domain',''))
++                        conf=float(rr.get('confidence',0) or 0)
++                        rel=(rr.get('relationship') or 'related').lower().strip()
++                        min_conf=float(env('MIN_RELATIONSHIP_CONFIDENCE','0.72'))
++                        min_queue=float(env('MIN_RELATIONSHIP_QUEUE_SCORE','55'))
++                        if not rd or rd in seen_in_family or rd in done or conf < min_conf or float(rr.get('queue_score') or 0) < min_queue:
++                            continue
++                        if added >= cfg['max_related_per_company']:
++                            break
++                        await save_relationship(jid,family_id,domain,rr)
++                        await find_or_create_company(jid,family_id,root,rd,rel,domain,rr.get('company') or rr.get('name'))
++                        frontier.append((rd,rel,domain,conf))
++                        # Mark at enqueue time, not only when the child starts, so two
++                        # concurrent parent results cannot enqueue the same subsidiary.
++                        seen_in_family.add(rd)
++                        added+=1
++                    await append_log(jid,f'{domain}: corporate research found {len(related or [])} candidates; queued {added}.')
++                cfg['family_credit_usage'][root]=family_state['credits_used']
++                await update_job(jid, config=cfg)
++                await update_stats(jid, root_companies=len(roots), companies_processed=total_companies, seamless_credits_used=total_credits, current_company=','.join(x[0] for x in batch), current_root=root, leads_saved=total_leads)
++
++            await update_stats(jid, root_companies=len(roots), companies_processed=total_companies, seamless_credits_used=total_credits, current_company=root, current_root=root, leads_saved=total_leads)
++            await append_log(jid,f'Family {root} complete. Companies processed: {processed_in_family}. Leads saved: {family_state.get("leads_saved",0)}.')
++
++        job=await get_job(jid); st=(job or {}).get('stats') or {}
++        st.update({'root_companies':len(roots),'companies_processed':total_companies,'seamless_credits_used':total_credits,'leads_saved':total_leads})
+         await update_job(jid,status='completed',stats=st)
+         await append_log(jid,'Job completed')
+     except Exception as e:
+@@ -853,6 +884,23 @@
+     return {'ok':True}
+ 
+ 
++class LeadDeleteIn(BaseModel):
++    lead_ids: list[str] = Field(min_length=1, max_length=500)
++
++@app.delete('/api/jobs/{jid}/leads')
++async def delete_selected_leads(jid: str, inp: LeadDeleteIn, _: bool = Depends(auth)):
++    job=await get_job(jid)
++    if not job: raise HTTPException(404,'job not found')
++    rows=await sb_select('leads', params={'job_id':f'eq.{jid}','id':f'in.({",".join(inp.lead_ids)})','select':'id','limit':'5000'})
++    deleted=0
++    for r in rows or []:
++        try:
++            await sb_delete('leads', {'id':r['id']})
++            deleted += 1
++        except Exception:
++            pass
++    return {'ok':True,'deleted':deleted}
++
+ class XRayToolIn(BaseModel):
+     company: str = ''
+     domain: str = ''
+@@ -878,7 +926,10 @@
+ async def api_email_candidates(inp: EmailToolIn, _: bool = Depends(auth)):
+     domain=norm_domain(inp.domain)
+     if not domain: raise HTTPException(400,'valid company domain is required')
+-    return {'ok':True, **(await email_candidates_and_mx(inp.first_name, inp.last_name, domain))}
++    candidates=email_permutations(inp.first_name, inp.last_name, domain)
++    mx=await mx_hosts(domain)
++    catch=await detect_catch_all(domain,mx)
++    return {'ok':True,'candidates':[{'email':x,'syntax_ok':True} for x in candidates],**catch}
+ 
+ class PublicParseIn(BaseModel):
+     urls: list[str] = Field(min_length=1, max_length=10)
+@@ -940,8 +991,16 @@
+ 
+ 
+ @app.get('/api/jobs/{jid}/export')
+-async def export_job_file(jid: str, _: bool = Depends(auth)):
++async def export_job_file(jid: str, format: str='xlsx', _: bool = Depends(auth)):
+     job=await get_job(jid)
+     if not job: raise HTTPException(404,'job not found')
++    fmt=(format or 'xlsx').lower().strip()
++    leads=await sb_select('leads',params={'job_id':f'eq.{jid}','select':'company,domain,relationship,name,title,matched_title,title_score,similarity,linkedin,phone,email,source,seamless_key_index','order':'title_score.desc','limit':'5000'})
++    fields=['company','domain','relationship','name','title','matched_title','title_score','similarity','linkedin','phone','email','source','seamless_key_index']
++    if fmt=='json':
++        return JSONResponse({'job_id':jid,'status':job.get('status'),'leads':leads})
++    if fmt=='csv':
++        out=io.StringIO(); w=csv.DictWriter(out,fieldnames=fields); w.writeheader(); w.writerows([{k:r.get(k,'') for k in fields} for r in leads]); data=out.getvalue().encode('utf-8-sig')
++        return StreamingResponse(io.BytesIO(data),media_type='text/csv',headers={'Content-Disposition':f'attachment; filename="prospecting_{jid[:8]}.csv"'})
+     buf=await export_rows(jid)
+     return StreamingResponse(buf,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':f'attachment; filename="prospecting_{jid[:8]}.xlsx"'})

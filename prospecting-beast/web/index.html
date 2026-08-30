@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Prospecting Beast // Terminal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="shell">
+  <header class="topbar">
+    <div class="brand"><span class="mark">PB</span><span class="brand-text">Prospecting Beast</span></div>
+    <div id="statusPill" class="status-pill idle"><span class="dot"></span><span id="statusText">IDLE</span></div>
+    <div class="top-actions">
+      <button class="icon-btn" id="advancedBtn" title="Advanced settings">⚙️ <span>Advanced</span></button>
+      <div class="export-wrap"><button class="top-btn" id="exportBtn" disabled>📤 Export All</button><div id="exportMenu" class="export-menu hidden"><button onclick="downloadExport('xlsx')">Excel</button><button onclick="downloadExport('csv')">CSV</button><button onclick="downloadExport('json')">JSON</button></div></div>
+      <span id="clock" class="clock">--:--:--</span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="main-col">
+      <section class="hero-card">
+        <div class="hero-copy"><div class="eyebrow">ZERO-CONFIG OSINT TERMINAL</div><h1>Find the right people.<br><span>Nothing else gets in the way.</span></h1><p>Paste company domains. Scan. Review. Enrich only what you choose.</p></div>
+        <div class="scan-row"><textarea id="sites" placeholder="Paste your target domains here... (e.g., microsoft.com, amazon.com)"></textarea><button id="scanBtn" class="scan-btn" onclick="startJob()"><span>SCAN</span><kbd>⌘↵</kbd></button></div>
+        <div class="quickbar"><span id="currentJob">Current Job: —</span><span>→</span><span id="currentCompany">Company: —</span><span>→</span><span id="prospectsFound">Prospects found: 0</span></div>
+      </section>
+
+      <section class="results-shell">
+        <div class="results-head">
+          <div class="results-title"><div class="eyebrow">INTELLIGENCE</div><h2>Prospects</h2><span id="resultCount" class="count">0</span></div>
+          <div class="results-actions"><input id="leadFilter" class="filter" placeholder="filter by name/company..." oninput="renderResults()"><button id="enrichBtn" class="action-btn primary" onclick="enrichSelected()" disabled>⚡ Enrich Selected <span id="enrichCount">0</span></button><button id="deleteBtn" class="action-btn danger" onclick="deleteSelected()" disabled>🗑 Delete Selected</button></div>
+        </div>
+        <div class="table-wrap"><table><thead><tr><th class="check-col"><input id="selectAll" type="checkbox" onchange="toggleAll(this.checked)"></th><th>Score</th><th>Candidate</th><th>Matched Role</th><th>Status</th><th>Contact Info</th><th>🔗 Link</th></tr></thead><tbody id="leadRows"><tr><td colspan="7" class="empty">Paste domains above and hit <b>SCAN</b>.</td></tr></tbody></table></div>
+      </section>
+    </section>
+
+    <aside class="log-col">
+      <div class="log-head"><div><div class="eyebrow">LIVE</div><h2>Log</h2></div><div class="log-actions"><button onclick="clearLog()">Clear</button><button onclick="exportLog()">Export</button></div></div>
+      <div id="log" class="log"></div>
+      <div class="log-footer"><span id="logState">waiting</span><span id="jobMini">—</span></div>
+    </aside>
+  </main>
+</div>
+
+<div id="advanced" class="modal hidden"><div class="modal-card"><div class="modal-head"><div><div class="eyebrow">ADVANCED</div><h2>Scan controls</h2><p>Settings apply to the next scan. No save button.</p></div><button class="close" onclick="toggleAdvanced(false)">×</button></div>
+  <div class="advanced-grid">
+    <label>Role Mode<select id="mode"><option value="f">F</option><option value="nf">NF</option><option value="both">Both</option></select></label>
+    <label>Max People / Company<input id="maxp" type="number" min="1" max="100" value="5"></label>
+    <label>Web Search Budget<input id="webq" type="number" min="1" max="16" value="8"></label>
+    <label>Location<input id="location" placeholder="optional"></label>
+    <label>Industry<input id="industry" placeholder="optional"></label>
+    <label>Web Minimum Qualified<input id="webmin" type="number" min="0" max="50" value="5"></label>
+    <label>Tavily Job Budget<input id="tavilyBudget" type="number" min="1" max="500" value="40"></label>
+    <label>Max Related / Company<input id="maxr" type="number" min="0" max="50" value="6"></label>
+    <label>Max Companies / Family<input id="maxc" type="number" min="1" max="500" value="25"></label>
+    <label class="span-2">Excluded Contacts<textarea id="excluded" placeholder="One per line: Name | Email | LinkedIn"></textarea></label>
+    <label class="toggle-row"><input id="agentic" type="checkbox"><span>Gemini planner</span></label>
+    <label class="toggle-row"><input id="osint" type="checkbox"><span>Passive OSINT</span></label>
+    <label class="toggle-row"><input id="dry" type="checkbox" checked><span>Dry run</span></label>
+  </div>
+  <div class="advanced-footer"><span id="excludedCount">0 excluded</span><span>Advanced controls stay hidden during normal scans.</span></div>
+</div></div>
+
+<script>
+let selected=null,timer=null,jobsCache=[],detail=null,selectedIds=new Set(),logEntries=[];
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+async function api(url,opts={}){const r=await fetch(url,opts);let d={};try{d=await r.json()}catch{}if(!r.ok)throw new Error(d.detail||d.error||`HTTP ${r.status}`);return d;}
+function tickClock(){ $('clock').textContent=new Date().toLocaleTimeString(); } setInterval(tickClock,1000);tickClock();
+function toggleAdvanced(open){$('advanced').classList.toggle('hidden',open===false?true:open===true?false:$('advanced').classList.contains('hidden'));}
+$('advancedBtn').onclick=()=>toggleAdvanced(true);$('advanced').onclick=e=>{if(e.target.id==='advanced')toggleAdvanced(false)};
+document.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')startJob();if(e.key==='Escape')toggleAdvanced(false)});
+$('exportBtn').onclick=e=>{$('exportMenu').classList.toggle('hidden');e.stopPropagation()};document.addEventListener('click',e=>{if(!e.target.closest('.export-wrap'))$('exportMenu').classList.add('hidden')});
+function setStatus(status){const map={running:['RUNNING','running'],queued:['QUEUED','running'],stopping:['STOPPING','running'],completed:['IDLE','idle'],stopped:['STOPPED','stopped'],failed:['STOPPED','stopped']};const x=map[status]||['IDLE','idle'];$('statusText').textContent=x[0];$('statusPill').className='status-pill '+x[1];$('logState').textContent=status||'waiting';}
+function timeStr(v){return new Date(v?new Date(v).getTime():Date.now()).toLocaleTimeString([], {hour12:false});}
+function addLog(msg,level='info',dedupe=false){if(dedupe && logEntries.some(x=>x.message===msg))return;const row={time:timeStr(),level,message:String(msg)};logEntries.push(row);logEntries=logEntries.slice(-500);const el=document.createElement('div');el.className='log-line '+level;el.innerHTML=`<span class="ts">[${row.time}]</span><span class="lvl">[${esc(level.toUpperCase())}]</span><span class="msg">→ ${esc(row.message)}</span>`;$('log').appendChild(el);$('log').scrollTop=$('log').scrollHeight;}
+function clearLog(){logEntries=[];$('log').innerHTML='';addLog('log cleared','info')}
+function exportLog(){const text=logEntries.map(x=>`[${x.time}] [${x.level.toUpperCase()}] → ${x.message}`).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:'text/plain'}));a.download=`prospecting_beast_log_${new Date().toISOString().slice(0,10)}.txt`;a.click();URL.revokeObjectURL(a.href)}
+function currentConfig(){return {mode:$('mode').value,max_people_per_company:+$('maxp').value,max_enrich_per_family:20,max_related_per_company:+$('maxr').value,max_companies_per_family:+$('maxc').value,dry_run:$('dry').checked,web_min_qualified:+$('webmin').value,web_search_budget:+$('webq').value,tavily_job_budget:+$('tavilyBudget').value,location:$('location').value,industry:$('industry').value,osint_provider:$('osint').checked?'web+osint':'web',spiderfoot_enabled:false,amass_enabled:false,agentic_discovery:$('agentic').checked,excluded_people:$('excluded').value.split(/\n/).map(x=>x.trim()).filter(Boolean)}}
+function updateExcluded(){const n=$('excluded').value.split(/\n/).map(x=>x.trim()).filter(Boolean).length;$('excludedCount').textContent=`${n} excluded`}
+$('excluded').addEventListener('input',updateExcluded)
+async function startJob(){const websites=$('sites').value.split(/\n|,/).map(x=>x.trim()).filter(Boolean);if(!websites.length){addLog('No domains entered.','warning');return} $('scanBtn').disabled=true;try{const cfg=currentConfig();addLog(`starting scan for ${websites.length} domain${websites.length>1?'s':''}`);const d=await api('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({websites,...cfg})});selected=d.id;$('currentJob').textContent=`Current Job: ${d.id.slice(0,8)}`;addLog(`job ${d.id.slice(0,8)} queued`,'success');watch(selected)}catch(e){addLog(e.message,'error')}finally{$('scanBtn').disabled=false}}
+async function watch(id){clearTimeout(timer);async function tick(){try{const d=await api('/api/jobs/'+id);detail=d;render(d);if(['queued','running','stopping'].includes(d.job.status)){timer=setTimeout(tick,1000)}else{await loadJobs()}}catch(e){addLog(e.message,'error');timer=setTimeout(tick,2500)}}tick()}
+function scoreClass(s){s=+s||0;return s>=85?'high':s>=60?'mid':'low'}
+function leadStatus(l){const r=l.raw||{};return String(r._enrichment_status||((l.phone||l.email)?'enriched':'ready')).toLowerCase()}
+function renderResults(){const all=Array.isArray(detail?.leads)?detail.leads:[];const q=($('leadFilter').value||'').toLowerCase().trim();const rows=all.filter(l=>[l.name,l.company,l.domain,l.title,l.matched_title].some(v=>String(v||'').toLowerCase().includes(q)));$('resultCount').textContent=rows.length;const checkedCount=[...selectedIds].filter(id=>all.some(l=>String(l.id)===id)).length;$('enrichCount').textContent=checkedCount;$('enrichBtn').disabled=checkedCount===0;$('deleteBtn').disabled=checkedCount===0;$('selectAll').checked=rows.length>0&&rows.every(l=>selectedIds.has(String(l.id)));$('leadRows').innerHTML=rows.length?rows.map(l=>{const s=Number(l.title_score||0);const st=leadStatus(l);const raw=l.raw||{};const linkedin=l.linkedin||'';const link=linkedin?`https://www.google.com/search?q=${encodeURIComponent('site:linkedin.com/in '+linkedin)}`:'#';return `<tr><td class="check-col"><input type="checkbox" ${selectedIds.has(String(l.id))?'checked':''} onchange="toggleOne('${String(l.id)}',this.checked)"></td><td><span class="score ${scoreClass(s)}">${Math.round(s)}</span></td><td><b>${esc(l.name||'Unknown')}</b><small>${esc(l.domain||l.company||'')}</small></td><td><b>${esc(l.matched_title||'—')}</b><small>${esc(l.title||'—')}</small></td><td><span class="pill ${esc(st)}">${esc(st[0]?.toUpperCase()+st.slice(1))}</span></td><td>${l.phone?`<span>${esc(l.phone)}</span>`:''}${l.email?`<span>${esc(l.email)}</span>`:''}${(!l.phone&&!l.email)?'<span class="muted">—</span>':''}</td><td>${linkedin?`<a class="link" target="_blank" rel="noopener" href="${link}">Google → LinkedIn</a>`:'<span class="muted">—</span>'}</td></tr>`}).join(''):'<tr><td colspan="7" class="empty">No matching prospects.</td></tr>'}
+function toggleOne(id,on){on?selectedIds.add(id):selectedIds.delete(id);renderResults()}
+function toggleAll(on){const rows=(detail?.leads||[]).filter(l=>{const q=($('leadFilter').value||'').toLowerCase().trim();return !q||[l.name,l.company,l.domain,l.title,l.matched_title].some(v=>String(v||'').toLowerCase().includes(q))});rows.forEach(l=>on?selectedIds.add(String(l.id)):selectedIds.delete(String(l.id)));renderResults()}
+async function enrichSelected(){if(!selected||!selectedIds.size)return;const ids=[...selectedIds];addLog(`enrichment queued for ${ids.length} selected lead${ids.length>1?'s':''}`);try{await api('/api/jobs/'+selected+'/enrich',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lead_ids:ids})});watch(selected)}catch(e){addLog(e.message,'error')}}
+async function deleteSelected(){if(!selected||!selectedIds.size)return;if(!confirm('Delete selected leads from this job?'))return;try{await api('/api/jobs/'+selected+'/leads',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({lead_ids:[...selectedIds]})});selectedIds.clear();addLog('selected leads deleted','success');watch(selected)}catch(e){addLog(e.message,'error')}}
+async function loadJobs(){try{jobsCache=await api('/api/jobs');if(!selected&&jobsCache[0]){selected=jobsCache[0].id;watch(selected)}}catch(e){addLog('history: '+e.message,'warning',true)}}
+function render(d){const job=d.job||{};setStatus(job.status);const s=job.stats||{};$('currentJob').textContent=`Current Job: ${job.id?.slice(0,8)||'—'}`;$('currentCompany').textContent=`Company: ${s.current_company||'—'}`;$('prospectsFound').textContent=`Prospects found: ${(d.leads||[]).length}`;$('jobMini').textContent=job.id?.slice(0,8)||'—';$('exportBtn').disabled=!(d.leads||[]).length;renderResults();const fresh=(d.logs||[]).filter(x=>x.message);if(fresh.length){const last=logEntries.length?logEntries[logEntries.length-1]?.message:'';const recent=fresh.slice(-12);for(const l of recent){if(l.message!==last||logEntries.filter(x=>x.message===l.message).length===0)addLog(l.message,l.level||'info')}}}
+function downloadExport(fmt){if(!selected)return;window.location=`/api/jobs/${selected}/export?format=${fmt}`;$('exportMenu').classList.add('hidden')}
+loadJobs();updateExcluded();addLog('terminal ready','success');
+</script>
+</body></html>

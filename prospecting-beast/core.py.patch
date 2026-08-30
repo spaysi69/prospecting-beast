@@ -1,0 +1,131 @@
+--- /mnt/data/audit_v33/app/core.py	2026-08-30 22:07:48.000000000 +0000
++++ app/core.py	2026-08-30 22:34:00.297979706 +0000
+@@ -7,6 +7,7 @@
+ from bs4 import BeautifulSoup
+ from dotenv import load_dotenv
+ from .osint_tools import xray_matrix, extract_public_emails
++from .cache import CACHE
+ 
+ BASE = Path(__file__).resolve().parents[1]
+ load_dotenv(BASE / '.env')
+@@ -220,11 +221,17 @@
+             'Include titles close/related to target roles; local fuzzy matching decides qualification. '
+             'Ignore customers, competitors, authors, speakers, and unclear employment. '
+             'Return ONLY JSON: {"people":[{"name":"","title":"","linkedin_url":"","source_url":""}]}')
++    payload={'company':company,'domain':domain,'mode':mode,'targets':targets,'evidence':evidence}
++    cached=CACHE.get('gemini_people', payload)
++    if cached is not None:
++        return cached
+     body={'contents':[{'parts':[{'text':prompt+f'\nTarget company: {company} ({domain})\nTarget roles: {json.dumps(targets)}\nEvidence:\n{json.dumps(evidence)[:50000]}'}]}], 'generationConfig':{'responseMimeType':'application/json','temperature':0.0}}
+     async with await http_client() as c:
+         try:
+             r=await c.post(f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}',json=body); r.raise_for_status()
+-            obj=json.loads(r.json()['candidates'][0]['content']['parts'][0]['text']); return obj.get('people',[]) if isinstance(obj,dict) else []
++            obj=json.loads(r.json()['candidates'][0]['content']['parts'][0]['text']); result=obj.get('people',[]) if isinstance(obj,dict) else []
++            CACHE.set('gemini_people', payload, result)
++            return result
+         except Exception: return []
+ 
+ 
+@@ -413,6 +420,15 @@
+         return []
+ 
+ 
++def adaptive_search_budget(domain: str, requested: int) -> tuple[int, str]:
++    requested=max(1,min(int(requested or 8),16))
++    mega={"microsoft.com","google.com","apple.com","amazon.com","meta.com","ibm.com","oracle.com","salesforce.com","sap.com","adobe.com","intel.com","nvidia.com","cisco.com","accenture.com","deloitte.com","pwc.com","ey.com","kpmg.com"}
++    small_hint={x.strip().lower() for x in env('PB_STARTUP_DOMAINS','').split(',') if x.strip()}
++    d=norm_domain(domain)
++    if d in mega: return min(requested,4), 'mega-corp'
++    if d in small_hint: return max(requested,12), 'startup-hint'
++    return requested, 'default'
++
+ async def web_people_discovery(company: str, domain: str, mode: str, max_people: int=10, search_budget: int=8, location: str="", industry: str="", agentic: bool=False) -> dict:
+     """Web-first employee discovery.
+ 
+@@ -425,7 +441,7 @@
+     No paid employee database is required. Tavily is the public-web retrieval layer; Gemini only structures evidence.
+     """
+     max_people = max(1, min(int(max_people or 10), 25))
+-    search_budget = max(1, min(int(search_budget or 8), 16))
++    search_budget, budget_reason = adaptive_search_budget(domain, search_budget)
+     qbase = (company or '').strip() or domain
+ 
+     evidence: list[dict] = []
+@@ -440,6 +456,15 @@
+         })
+     if evidence:
+         people.extend(await gemini_extract_people(qbase, domain, evidence, mode))
++        # Absolute quota guard after the first extraction batch. Do not run Tavily or
++        # optional passive connectors when the requested number is already satisfied.
++        initial_qualified=sum(1 for p in people if base_score(p.get('title') or p.get('job_title') or '', mode))
++        if initial_qualified >= max_people:
++            return {
++                'people': people[:max_people], 'evidence_count': len(evidence), 'query_count': 0,
++                'estimated_tavily_credits': 0, 'target_terms': list(title_dictionary(mode).keys()),
++                'sources_used': ['official_company_page'], 'budget': search_budget, 'budget_reason': budget_reason,
++            }
+ 
+     # Adaptive OSINT: official pages + optional passive open-source connectors + targeted public-web queries.
+     official_pages = official_pages  # keep first-party evidence gathered above
+@@ -502,9 +527,9 @@
+         # Re-extract after every 2 searches and stop once enough quality prospects exist.
+         if (i + 1) % 2 == 0 or i == len(queries)-1:
+             batch = await gemini_extract_people(qbase, domain, evidence[-32:], mode)
+-            before=len(people)
+             add_people(batch)
+-            # Stop once we have enough raw candidates that can be locally qualified.
++            # Hard stop: once a Gemini extraction batch yields enough qualified people,
++            # do not spend another Tavily query or another extraction round.
+             qualified=sum(1 for p in people if base_score(p.get('title') or p.get('job_title') or '', mode))
+             if qualified >= max_people:
+                 break
+@@ -551,6 +576,7 @@
+         'estimated_tavily_credits': sum(2 if (item[1]=='linkedin' and i < 2) else 1 for i, item in enumerate(queries)),
+         'target_terms': list(title_dictionary(mode).keys()),
+         'sources_used': sorted(set((e.get('source') or e.get('query') or 'web').split(':')[0] for e in evidence)),
++        'budget': search_budget, 'budget_reason': budget_reason,
+     }
+ 
+ async def tavily_search(query: str, max_results: int = 6, *, search_depth: str='basic', include_domains=None, exclude_domains=None, include_raw_content: bool=False):
+@@ -569,12 +595,17 @@
+         payload['include_domains']=include_domains
+     if exclude_domains:
+         payload['exclude_domains']=exclude_domains
++    cached = CACHE.get('tavily', payload)
++    if cached is not None:
++        return cached
+     async with await http_client() as c:
+         r = await c.post('https://api.tavily.com/search',
+                          headers={'Authorization': f'Bearer {key}', 'Content-Type':'application/json'},
+                          json=payload)
+         r.raise_for_status()
+-        return r.json()
++        data = r.json()
++        CACHE.set('tavily', payload, data)
++        return data
+ 
+ 
+ async def gemini_classify(company: str, domain: str, evidence: list[dict]):
+@@ -584,6 +615,10 @@
+         raise RuntimeError('Missing GEMINI_API_KEY')
+     prompt = """You are a strict corporate-structure verifier. Use ONLY the supplied search evidence. Identify credible corporate-family entities directly related to the target company. Valid relationships: parent, subsidiary, sister, brand, acquired_target, related, unknown. Do not invent domains. Prefer official company pages, filings, exchange disclosures, acquisition announcements, or reputable business sources. Return ONLY JSON in this shape: {\"relationships\":[{\"company\":\"...\",\"domain\":\"...\",\"relationship\":\"parent|subsidiary|sister|brand|acquired_target|related|unknown\",\"confidence\":0.0,\"reason\":\"...\"}]}. Ignore entities that are merely customers, partners, suppliers, competitors, people, or articles that mention the company without a corporate relationship."""
+     payload_evidence = evidence or []
++    cache_payload={'company':company,'domain':domain,'evidence':payload_evidence}
++    cached=CACHE.get('gemini_family', cache_payload)
++    if cached is not None:
++        return cached
+     body = {'contents':[{'parts':[{'text': prompt + f'\\nTarget: {company} ({domain})\\nEvidence:\\n{json.dumps(payload_evidence)[:45000]}'}]}], 'generationConfig':{'responseMimeType':'application/json','temperature':0.0}}
+     try:
+         async with await http_client() as c:
+@@ -599,7 +634,9 @@
+                 return []
+             obj = json.loads(text)
+             rels = obj.get('relationships', []) if isinstance(obj, dict) else []
+-            return rels if isinstance(rels, list) else []
++            result = rels if isinstance(rels, list) else []
++            CACHE.set('gemini_family', cache_payload, result)
++            return result
+     except Exception:
+         return []
+ 
